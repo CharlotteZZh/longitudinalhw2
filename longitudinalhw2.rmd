@@ -1,0 +1,331 @@
+---
+title: "P8157 Homework 2"
+author: "Jiaxin Zhang (jz4027)"
+output:
+  pdf_document:
+    number_sections: false
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \floatplacement{table}{H}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4, fig.align = "center")
+library(nlme)
+library(splines)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+```
+
+# Question 1
+
+```{r data}
+load("MACS-VL.RData")
+dat <- macsVL %>%
+  arrange(id, month) %>%
+  mutate(lvl = log10(vload),   # log10 baseline viral load
+         x   = lvl - 4)        # centered at 10,000 copies/mL
+subj <- dat %>% group_by(id) %>%
+  summarise(vload = first(vload), lvl = first(lvl), n_obs = n(),
+            fu = max(month), cd4_base = cd4[which.min(month)])
+```
+
+## (a) Descriptive summaries
+
+```{r summ-a}
+c(subjects = nrow(subj), observations = nrow(dat))
+summary(subj$n_obs)   # measurements per subject
+summary(subj$fu)      # follow-up (months since seroconversion)
+summary(subj$vload)   # baseline viral load (copies/mL)
+summary(subj$lvl)     # log10 baseline viral load
+summary(dat$cd4)      # CD4+ count (all visits)
+```
+
+```{r plots-a, fig.height=3.2}
+par(mfrow = c(1, 2))
+hist(subj$vload / 1000, breaks = 30, main = "Baseline viral load",
+     xlab = "Viral load (1,000 copies/mL)")
+hist(subj$lvl, breaks = 20, main = "log10 baseline viral load",
+     xlab = "log10 viral load")
+```
+
+```{r plots-a2, fig.height=4}
+dat$vl_tert <- cut(dat$lvl, quantile(subj$lvl, c(0, 1/3, 2/3, 1)),
+                   include.lowest = TRUE,
+                   labels = c("Low VL tertile", "Middle VL tertile", "High VL tertile"))
+ggplot(dat, aes(month, cd4)) +
+  geom_line(aes(group = id), alpha = 0.25) +
+  geom_smooth(method = "loess", se = FALSE, colour = "red") +
+  facet_wrap(~ vl_tert) +
+  labs(x = "Months since seroconversion", y = "CD4+ count") +
+  theme_bw()
+```
+
+```{r slopes-a, fig.height=3.5, fig.width=5}
+# subject-specific OLS slopes vs baseline viral load
+subj$slope <- sapply(split(dat, dat$id), function(d) unname(coef(lm(cd4 ~ month, data = d))[2]))
+ggplot(subj, aes(lvl, slope)) + geom_point() +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(x = "log10 baseline viral load", y = "Individual OLS slope (cells/month)") +
+  theme_bw()
+cor(subj$lvl, subj$slope)
+# median individual slope by viral load tertile
+tapply(subj$slope, cut(subj$lvl, quantile(subj$lvl, c(0, 1/3, 2/3, 1)),
+                       include.lowest = TRUE), median)
+```
+
+**Summary.** $K=225$ men contribute 1,684 CD4+ measurements (median 8 per subject) at irregular times over up to 48 months. Baseline viral load is highly right-skewed (median 24,573 copies/mL, range 300--1,026,656), so we use $\log_{10}$ viral load, which is roughly symmetric. CD4+ declines over time in all viral load tertiles; higher viral load is associated with lower CD4+ at seroconversion and slightly steeper individual slopes (median $-5.6$, $-7.1$, $-6.7$ cells/month by tertile; correlation with $\log_{10}$ VL $=-0.13$).
+
+## (b) Exploratory analysis of the covariance structure
+
+Residuals from an OLS fit of the mean model are grouped into 6-month windows (visit times are irregular); we also compute the sample variogram.
+
+```{r cov-b}
+dat$res <- resid(lm(cd4 ~ month * x, data = dat))
+dat$tbin <- 6 * round(dat$month / 6)
+wide <- dat %>% group_by(id, tbin) %>% summarise(res = mean(res), .groups = "drop") %>%
+  pivot_wider(names_from = tbin, values_from = res) %>% select(-id)
+wide <- wide[, order(as.numeric(names(wide)))]
+round(sapply(wide, sd, na.rm = TRUE))                    # SD by time window
+round(cor(wide, use = "pairwise.complete.obs"), 2)       # correlation matrix
+```
+
+```{r pairs-b, fig.height=6, fig.width=6}
+pairs(wide[, c("0", "12", "24", "36", "48")], pch = 20, cex = 0.5,
+      main = "Residuals at months 0, 12, 24, 36, 48")
+```
+
+```{r vario-b, fig.height=3.5, fig.width=5}
+fit0 <- gls(cd4 ~ month * x, data = dat)
+vg <- Variogram(fit0, form = ~ month | id, resType = "response")
+plot(vg, ylim = c(0, max(vg$variog) * 1.1),
+     xlab = "Lag (months)", main = "Sample variogram")
+# process variance (total variance of residuals) for reference
+var(dat$res)
+```
+
+**Interpretation.** The residual SD is roughly constant over time (250--340). Correlations are high (0.39--0.84) and decrease with lag but do not approach zero; the variogram likewise rises with lag but stays well below the total variance ($\approx 82{,}500$).
+
+Hence **compound symmetry** is a reasonable approximation, while an **exponential (AR(1)-type) correlation plus a random intercept**, or a **random intercept and slope** model, would capture the decay with lag better. Pure AR(1) is not plausible since correlations do not decay to zero.
+
+## (c) Linear model in log viral load, compound symmetry, ML vs REML
+
+We use $x_k = \log_{10}(\text{baseline VL}) - 4$ (centered at 10,000 copies/mL).
+
+```{r fit-c}
+fit_ml   <- gls(cd4 ~ month * x, data = dat, method = "ML",
+                correlation = corCompSymm(form = ~ 1 | id))
+fit_reml <- gls(cd4 ~ month * x, data = dat, method = "REML",
+                correlation = corCompSymm(form = ~ 1 | id))
+
+tab_fit <- function(fit) {
+  ct <- summary(fit)$tTable
+  ci <- confint(fit)   # Wald 95% CI
+  data.frame(Est = ct[, 1], SE = ct[, 2], Lower = ci[, 1], Upper = ci[, 2], p = ct[, 4])
+}
+tab_c <- cbind(tab_fit(fit_ml), tab_fit(fit_reml))
+rownames(tab_c) <- c("Intercept (beta0)", "Month (beta1)",
+                     "log10 VL (beta2)", "Month x log10 VL (beta3)")
+vc <- function(fit) c(sigma = fit$sigma,
+                      rho = coef(fit$modelStruct$corStruct, unconstrained = FALSE),
+                      logLik = as.numeric(logLik(fit)))
+kable(tab_c, digits = c(2, 2, 2, 2, 4, 2, 2, 2, 2, 4),
+      format = "latex", booktabs = TRUE,
+      col.names = rep(c("Est.", "SE", "2.5%", "97.5%", "p"), 2),
+      caption = "GLS estimates with compound symmetric correlation: ML (left) and REML (right).")
+kable(rbind(ML = vc(fit_ml), REML = vc(fit_reml)), digits = 3, format = "latex", booktabs = TRUE,
+      col.names = c("sigma", "rho", "log-lik"),
+      caption = "Variance components.")
+```
+
+**Results.** ML and REML estimates are practically identical; REML gives slightly larger variance estimates and SEs, as expected. Within-subject correlation $\hat\rho \approx 0.57$.
+
+**Interpretation (REML estimates, 95% CI).**
+
+* $\hat\beta_0 = 779.3$ (744.1, 814.4): estimated mean CD4+ count at seroconversion ($t=0$) for men with a baseline viral load of 10,000 copies/mL ($\log_{10}$VL $=4$).
+* $\hat\beta_1 = -6.59$ ($-7.26$, $-5.92$): among men with a baseline viral load of 10,000 copies/mL, mean CD4+ count declines by an estimated 6.6 cells per month (about 79 cells per year).
+* $\hat\beta_2 = -82.2$ ($-122.9$, $-41.5$): at seroconversion, mean CD4+ count is 82.2 cells lower for each 1-unit higher $\log_{10}$ baseline viral load (i.e. each 10-fold higher viral load).
+* $\hat\beta_3 = -0.88$ ($-1.66$, $-0.09$): the rate of decline in mean CD4+ count is 0.88 cells/month steeper for each 10-fold higher baseline viral load.
+
+Since $p=0.029$ for $\beta_3$ (both ML and REML), there is a significant association between higher baseline viral load and a faster rate of CD4+ decline.
+
+## (d) Categorized baseline viral load (REML, compound symmetry)
+
+Baseline viral load is categorized by quartiles ($J=4$; Q1 = reference).
+
+```{r fit-d}
+q <- quantile(subj$vload, c(0, .25, .5, .75, 1))
+q
+dat$vlcat <- cut(dat$vload, q, include.lowest = TRUE,
+                 labels = c("Q1", "Q2", "Q3", "Q4"))
+table(subj = cut(subj$vload, q, include.lowest = TRUE, labels = c("Q1","Q2","Q3","Q4")))
+fit_d <- gls(cd4 ~ month * vlcat, data = dat, method = "REML",
+             correlation = corCompSymm(form = ~ 1 | id))
+tab_d <- tab_fit(fit_d)
+rownames(tab_d) <- c("Intercept (beta0)", "Month (beta1)",
+                     "Q2 (beta22)", "Q3 (beta23)", "Q4 (beta24)",
+                     "Month x Q2 (beta32)", "Month x Q3 (beta33)", "Month x Q4 (beta34)")
+kable(tab_d, digits = c(2, 2, 2, 2, 4), format = "latex", booktabs = TRUE,
+      col.names = c("Est.", "SE", "2.5%", "97.5%", "p"),
+      caption = paste0("REML GLS estimates, compound symmetry (sigma = ",
+                       round(fit_d$sigma, 1), ", rho = ",
+                       round(coef(fit_d$modelStruct$corStruct, unconstrained = FALSE), 3), ")."))
+
+# Slope (cells/month) within each viral load category
+L <- rbind(Q1 = c(0, 1, 0, 0, 0, 0, 0, 0),
+           Q2 = c(0, 1, 0, 0, 0, 1, 0, 0),
+           Q3 = c(0, 1, 0, 0, 0, 0, 1, 0),
+           Q4 = c(0, 1, 0, 0, 0, 0, 0, 1))
+est <- drop(L %*% coef(fit_d)); se <- sqrt(diag(L %*% vcov(fit_d) %*% t(L)))
+round(cbind(slope = est, SE = se, lower = est - 1.96 * se, upper = est + 1.96 * se), 2)
+
+# Joint Wald test of H0: beta_32 = beta_33 = beta_34 = 0 (slopes equal across categories)
+anova(fit_d, Terms = "month:vlcat")
+```
+
+**Interpretation (95% CI).** Quartiles: Q1 300--7,928; Q2 7,928--24,573; Q3 24,573--91,195; Q4 91,195--1,026,656 copies/mL.
+
+* $\hat\beta_0 = 859.9$ (795.4, 924.4): estimated mean CD4+ count at seroconversion in the lowest viral load quartile (Q1).
+* $\hat\beta_1 = -5.64$ ($-6.86$, $-4.43$): estimated rate of change in mean CD4+ count in Q1, a decline of 5.6 cells per month.
+* $\hat\beta_{2j}$: difference in mean CD4+ at seroconversion between quartile $j$ and Q1: $-112.7$ (Q2), $-146.1$ (Q3), $-177.8$ (Q4) cells.
+* $\hat\beta_{3j}$: difference in the monthly rate of change between quartile $j$ and Q1: $-1.93$ (Q2), $-1.81$ (Q3), $-1.26$ (Q4) cells/month, i.e. slopes of $-5.64$, $-7.57$, $-7.45$, $-6.90$ in Q1--Q4.
+
+The joint Wald test of $H_0:\beta_{32}=\beta_{33}=\beta_{34}=0$ gives $F_{3,1676}=2.02$, $p=0.11$, so there is no significant association between categorized baseline viral load and the rate of CD4+ decline in this model (although Q2 and Q3 individually differ from Q1).
+
+## (e) Varying coefficient model with natural cubic splines
+
+$\gamma_0(x)$ and $\gamma_1(x)$ are natural cubic splines in $\log_{10}$ VL with knots at the tertiles, fit by REML with compound symmetry:
+$$E[Y_{ki}] = \gamma_0(x_k) + \gamma_1(x_k)t_{ki},\qquad \gamma_j(x) = \alpha_{j0} + \sum_{l=1}^{3}\alpha_{jl}B_l(x),\ j = 0, 1,$$
+
+```{r fit-e}
+kn  <- quantile(subj$lvl, c(1/3, 2/3))
+kn
+nsb <- ns(subj$lvl, knots = kn)
+B   <- predict(nsb, dat$lvl); colnames(B) <- paste0("B", 1:3)
+dat <- cbind(dat, B)
+fit_e <- gls(cd4 ~ (B1 + B2 + B3) * month, data = dat, method = "REML",
+             correlation = corCompSymm(form = ~ 1 | id))
+
+# gamma_1(x) on a grid with pointwise 95% CI
+grid <- seq(min(subj$lvl), max(subj$lvl), length.out = 200)
+idx  <- grep("month", names(coef(fit_e)))          # month, B1:month, B2:month, B3:month
+Lg   <- cbind(1, predict(nsb, grid))
+g1   <- drop(Lg %*% coef(fit_e)[idx])
+g1se <- sqrt(rowSums((Lg %*% vcov(fit_e)[idx, idx]) * Lg))
+pe   <- data.frame(lvl = grid, g1 = g1, lo = g1 - 1.96 * g1se, hi = g1 + 1.96 * g1se,
+                   lin = coef(fit_reml)[2] + coef(fit_reml)[4] * (grid - 4))
+```
+
+```{r plot-e, fig.height=4, fig.width=6}
+ggplot(pe, aes(lvl)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "grey80") +
+  geom_line(aes(y = g1), linewidth = 1) +
+  geom_line(aes(y = lin), linetype = "dashed", colour = "red") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_vline(xintercept = kn, linetype = "dotted", colour = "grey50") +
+  geom_rug(data = subj, aes(x = lvl), inherit.aes = FALSE, alpha = 0.4) +
+  labs(x = expression(log[10]~"baseline viral load"),
+       y = expression(hat(gamma)[1](x)~"(CD4 cells/month)"),
+       caption = paste("Solid: spline estimate with pointwise 95% CI;",
+                       "dashed: linear model from (c) (REML); dotted: knots")) +
+  theme_bw()
+```
+
+```{r vals-e}
+# gamma_1 at selected viral loads
+xv <- log10(c(1000, 5000, 10000, 50000, 100000, 500000))
+Lv <- cbind(1, predict(nsb, xv))
+v  <- drop(Lv %*% coef(fit_e)[idx]); vse <- sqrt(rowSums((Lv %*% vcov(fit_e)[idx, idx]) * Lv))
+kable(data.frame(VL = format(10^xv, big.mark = ",", scientific = FALSE),
+                 spline = v, lower = v - 1.96 * vse, upper = v + 1.96 * vse,
+                 linear_c = coef(fit_reml)[2] + coef(fit_reml)[4] * (xv - 4)),
+      digits = 2, format = "latex", booktabs = TRUE, row.names = FALSE,
+      col.names = c("Baseline VL", "gamma1 (spline)", "2.5%", "97.5%", "gamma1 (model c)"),
+      caption = "Estimated rate of change in CD4+ (cells/month) at selected baseline viral loads.")
+
+# Model (c) is nested in the spline model: likelihood ratio test using ML fits
+fit_e_ml <- update(fit_e, method = "ML")
+anova(fit_ml, fit_e_ml)
+```
+
+**Interpretation.** $\hat\gamma_1(x)$ is the estimated rate of change in mean CD4+ (cells/month) at baseline $\log_{10}$ VL $x$; it is negative throughout. The decline is 5.5 cells/month (95% CI 4.1, 6.9) at 1,000 copies/mL, 7.0 (6.0, 8.0) at 10,000, roughly flat up to 100,000 (7.1), and 8.4 (6.2, 10.6) at 500,000 copies/mL.
+
+**Adequacy of model (c).** Apart from a mild plateau between $10^4$ and $10^5$ copies/mL, the linear fit from (c) lies within the 95% band everywhere (LRT vs. spline model $p=0.25$), suggesting model (c) is adequate.
+
+\newpage
+
+# Question 2
+
+*Notation.* Take $m=n$ and $\mathbf{J}_n=\mathbf{1}_n\mathbf{1}_n^\top$. Let
+$$\bar Y_{k\cdot}=\frac1n\sum_i Y_{ki},\quad \bar Y_{\cdot\cdot}=\frac1K\sum_k\bar Y_{k\cdot},\quad
+\text{SSE}=\sum_k\sum_i (Y_{ki}-\bar Y_{k\cdot})^2,\quad \text{SSA}=n\sum_k(\bar Y_{k\cdot}-\bar Y_{\cdot\cdot})^2,$$
+so $\text{MSE}=\text{SSE}/[K(n-1)]$ and $\text{MSA}=\text{SSA}/(K-1)$, and let $\lambda=\sigma^2+n\tau^2$.
+
+## (a) Likelihood and log-likelihood
+
+For unit $k$, $\mathbf{Y}_k=(Y_{k1},\dots,Y_{kn})^\top = \mu\mathbf{1}_n+\gamma_k\mathbf{1}_n+\boldsymbol\epsilon_k$, so
+$$\mathbf{Y}_k\sim N_n(\mu\mathbf{1}_n,\ \mathbf{V}),\qquad \mathbf{V}=\sigma^2\mathbf{I}_n+\tau^2\mathbf{J}_n,$$
+independently over $k$. Using the results given with $a=\sigma^2$, $b=\tau^2$:
+$$\mathbf{V}^{-1}=\frac{1}{\sigma^2}\left(\mathbf{I}_n-\frac{\tau^2}{\lambda}\mathbf{J}_n\right),\qquad |\mathbf{V}|=(\sigma^2)^{n-1}\lambda .$$
+For the quadratic form, write $\mathbf{r}_k=\mathbf{Y}_k-\mu\mathbf{1}_n$, so that $\mathbf{1}_n^\top\mathbf{r}_k=n(\bar Y_{k\cdot}-\mu)$ and $\mathbf{r}_k^\top\mathbf{r}_k=\sum_i(Y_{ki}-\bar Y_{k\cdot})^2+n(\bar Y_{k\cdot}-\mu)^2$. Then
+\begin{align*}
+\mathbf{r}_k^\top\mathbf{V}^{-1}\mathbf{r}_k
+&=\frac{1}{\sigma^2}\left[\sum_i(Y_{ki}-\bar Y_{k\cdot})^2+n(\bar Y_{k\cdot}-\mu)^2-\frac{\tau^2}{\lambda}n^2(\bar Y_{k\cdot}-\mu)^2\right]\\
+&=\frac{1}{\sigma^2}\sum_i(Y_{ki}-\bar Y_{k\cdot})^2+\frac{n(\bar Y_{k\cdot}-\mu)^2}{\sigma^2}\cdot\frac{\lambda-n\tau^2}{\lambda}
+=\frac{1}{\sigma^2}\sum_i(Y_{ki}-\bar Y_{k\cdot})^2+\frac{n(\bar Y_{k\cdot}-\mu)^2}{\lambda}.
+\end{align*}
+Also $\sum_k n(\bar Y_{k\cdot}-\mu)^2=\text{SSA}+nK(\bar Y_{\cdot\cdot}-\mu)^2$. Hence the likelihood is
+\begin{align*}
+L(\mu,\sigma^2,\tau^2)&=\prod_{k=1}^K(2\pi)^{-n/2}|\mathbf{V}|^{-1/2}\exp\left\{-\tfrac12\mathbf{r}_k^\top\mathbf{V}^{-1}\mathbf{r}_k\right\}\\
+&=(2\pi)^{-Kn/2}(\sigma^2)^{-K(n-1)/2}(\sigma^2+n\tau^2)^{-K/2}
+\exp\left\{-\frac{\text{SSE}}{2\sigma^2}-\frac{\text{SSA}+nK(\bar Y_{\cdot\cdot}-\mu)^2}{2(\sigma^2+n\tau^2)}\right\},
+\end{align*}
+and the log-likelihood is
+$$\ell(\mu,\sigma^2,\tau^2)=-\frac{Kn}{2}\log(2\pi)-\frac{K(n-1)}{2}\log\sigma^2-\frac{K}{2}\log(\sigma^2+n\tau^2)-\frac{\text{SSE}}{2\sigma^2}-\frac{\text{SSA}+nK(\bar Y_{\cdot\cdot}-\mu)^2}{2(\sigma^2+n\tau^2)}.$$
+
+## (b) Maximum likelihood estimators
+
+The map $(\sigma^2,\tau^2)\mapsto(\sigma^2,\lambda)$ is one-to-one, so by invariance we may maximize over $(\mu,\sigma^2,\lambda)$:
+$$\ell=c-\frac{K(n-1)}{2}\log\sigma^2-\frac{K}{2}\log\lambda-\frac{\text{SSE}}{2\sigma^2}-\frac{\text{SSA}+nK(\bar Y_{\cdot\cdot}-\mu)^2}{2\lambda}.$$
+
+* $\mu$: $\dfrac{\partial\ell}{\partial\mu}=\dfrac{nK(\bar Y_{\cdot\cdot}-\mu)}{\lambda}=0\ \Rightarrow\ \hat\mu=\bar Y_{\cdot\cdot}$ (for any $\sigma^2,\lambda$; $\ell$ is concave in $\mu$).
+* $\sigma^2$: $\dfrac{\partial\ell}{\partial\sigma^2}=-\dfrac{K(n-1)}{2\sigma^2}+\dfrac{\text{SSE}}{2\sigma^4}=0\ \Rightarrow\ \hat\sigma^2=\dfrac{\text{SSE}}{K(n-1)}=\text{MSE}.$
+* $\lambda$ (at $\mu=\hat\mu$): $\dfrac{\partial\ell}{\partial\lambda}=-\dfrac{K}{2\lambda}+\dfrac{\text{SSA}}{2\lambda^2}=0\ \Rightarrow\ \hat\lambda=\dfrac{\text{SSA}}{K}=\dfrac{K-1}{K}\text{MSA}=\left(1-\frac1K\right)\text{MSA}.$
+
+These are maxima since $-\frac{a}{2}\log v-\frac{b}{2v}$ is maximized at $v=b/a$. Therefore
+$$\hat\mu=\bar Y_{\cdot\cdot},\qquad\hat\sigma^2=\text{MSE},\qquad \hat\tau^2=\frac{\hat\lambda-\hat\sigma^2}{n}=\frac{(1-1/K)\,\text{MSA}-\text{MSE}}{n}.$$
+(This is the stated result with $m=n$.)
+
+## (c) Variance of $\hat\mu$
+
+The $\bar Y_{k\cdot}=\mu+\gamma_k+\bar\epsilon_{k\cdot}$ are independent with $\text{Var}(\bar Y_{k\cdot})=\tau^2+\sigma^2/n=\lambda/n$, so
+$$\text{Var}[\hat\mu]=\text{Var}[\bar Y_{\cdot\cdot}]=\frac{1}{K}\left(\tau^2+\frac{\sigma^2}{n}\right)=\frac{\sigma^2+n\tau^2}{nK}.$$
+Plugging in the MLEs,
+$$\widehat{\text{Var}}[\hat\mu]=\frac{\hat\sigma^2+n\hat\tau^2}{nK}=\frac{\hat\lambda}{nK}=\frac{(K-1)\,\text{MSA}}{nK^2}.$$
+
+## (d) REML estimators
+
+Integrate $\mu$ out of the likelihood in (a). Only the last term depends on $\mu$, and
+$$\int_{-\infty}^{\infty}\exp\left\{-\frac{nK(\bar Y_{\cdot\cdot}-\mu)^2}{2\lambda}\right\}d\mu=\left(\frac{2\pi\lambda}{nK}\right)^{1/2}.$$
+Hence the restricted likelihood is
+$$L_R(\sigma^2,\tau^2)=\int L\,d\mu=(2\pi)^{-(Kn-1)/2}(nK)^{-1/2}(\sigma^2)^{-K(n-1)/2}\lambda^{-(K-1)/2}\exp\left\{-\frac{\text{SSE}}{2\sigma^2}-\frac{\text{SSA}}{2\lambda}\right\},$$
+$$\ell_R=c-\frac{K(n-1)}{2}\log\sigma^2-\frac{K-1}{2}\log\lambda-\frac{\text{SSE}}{2\sigma^2}-\frac{\text{SSA}}{2\lambda}.$$
+Setting derivatives to zero:
+$$\frac{\partial\ell_R}{\partial\sigma^2}=-\frac{K(n-1)}{2\sigma^2}+\frac{\text{SSE}}{2\sigma^4}=0\Rightarrow\tilde\sigma^2=\text{MSE},\qquad
+\frac{\partial\ell_R}{\partial\lambda}=-\frac{K-1}{2\lambda}+\frac{\text{SSA}}{2\lambda^2}=0\Rightarrow\tilde\lambda=\frac{\text{SSA}}{K-1}=\text{MSA}.$$
+Therefore the REML estimators are
+$$\tilde\sigma^2=\text{MSE},\qquad \tilde\tau^2=\frac{\text{MSA}-\text{MSE}}{n}$$
+(These are the unbiased ANOVA estimators.)
+
+## (e) $F$-test of $H:\tau^2=0$
+
+We are given that
+$$\frac{\text{MSA}/(\sigma^2+n\tau^2)}{\text{MSE}/\sigma^2}=\frac{\text{MSA}}{\text{MSE}}\cdot\frac{\sigma^2}{\sigma^2+n\tau^2}\sim F_{K-1,\,K(n-1)}.$$
+Under $H:\tau^2=0$ we have $\sigma^2+n\tau^2=\sigma^2$, so the unknown variances cancel and
+$$F^\star=\frac{\text{MSA}}{\text{MSE}}\sim F_{K-1,\,K(n-1)}\quad\text{under }H .$$
+So $F^\star$ has a known null distribution and can be compared with $F_{K-1,K(n-1)}$. Under $\tau^2>0$, $F^\star$ is inflated by the factor $1+n\tau^2/\sigma^2$, so we reject $H$ for large values: $F^\star>F_{K-1,K(n-1);1-\alpha}$.
