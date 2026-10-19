@@ -1,6 +1,6 @@
 ---
 title: "P8157 Homework 2"
-author: "Charlotte Zhang (jz4027)"
+author: "Charlotte Zhang"
 output:
   pdf_document:
     number_sections: false
